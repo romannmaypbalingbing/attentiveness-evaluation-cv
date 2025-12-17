@@ -36,6 +36,14 @@ def analyze_gaze(frame):
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     soft = cv2.GaussianBlur(gray, (3,3), 0)
 
+    # --- FIX FOR CRASH: Check if resolution changed ---
+    if prev_gray is not None:
+        if prev_gray.shape != soft.shape:
+            # Resolution changed (e.g., switched from Cam to Video), reset tracker
+            prev_gray = None
+            pupil_point = None
+    # --------------------------------------------------
+
     # detects the face in the frame (only detects one person)
     faces = face_cascade.detectMultiScale(soft, 1.2, 5)
     detected_point = None
@@ -82,13 +90,17 @@ def analyze_gaze(frame):
     
     # still uses LK for pupil tracking (avoids repeated detection every frame)
     if prev_gray is not None and pupil_point is not None:
-        new_point, status, _ = cv2.calcOpticalFlowPyrLK(
-            prev_gray, soft, pupil_point, None, **lk_params
-        )
-        if status[0][0] == 1:
-            pupil_point = new_point
-            prev_gray = soft.copy()
-            return "ON_SCREEN"
+        try:
+            new_point, status, _ = cv2.calcOpticalFlowPyrLK(
+                prev_gray, soft, pupil_point, None, **lk_params
+            )
+            if status[0][0] == 1:
+                pupil_point = new_point
+                prev_gray = soft.copy()
+                return "ON_SCREEN"
+        except Exception:
+            # If tracking fails for any other reason, reset and continue
+            pupil_point = None
 
     if detected_point is not None:
         pupil_point = detected_point

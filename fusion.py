@@ -1,55 +1,67 @@
-# --- START OF FILE fusion.py ---
-from collections import deque
+# ------------------------------------------------
+# FUSION MODULE
+# Quantified Attentiveness via Time + Frequency
+# ------------------------------------------------
+
+from collections import deque, Counter
 import numpy as np
 
-THRESH_HIGH_ATTENTION = 0.70
-THRESH_LOW_ATTENTION = 0.40
-THRESH_DROWSY_MODEL = 0.50
+HIGH_ATTENTION = 0.7
+MID_ATTENTION = 0.4
+DROWSY_THRESHOLD = 0.5
+
+MIN_LOOKAWAY_SEC = 5          # tolerate thinking glances
+MAX_LOOKAWAY_SEC = 15         # cap penalty
+MAX_LOOKAWAY_EVENTS = 10      # cap frequency penalty
+
 
 class AttentionFusion:
-    def __init__(self, window_seconds=5, fps=30):
+    def __init__(self, fps=30, window_seconds=5):
         self.fps = fps
-        self.window_size = window_seconds * fps
+        self.window_size = fps * window_seconds
 
-        # Buffers
         self.gaze_buffer = deque(maxlen=self.window_size)
         self.engagement_buffer = deque(maxlen=self.window_size)
 
-        # Behavior history
+        self.current_off_frames = 0
+        self.off_durations = []
+        self.lookaway_events = 0
+
         self.behavior_history = []
 
-        # NEW: temporal tracking
-        self.current_off_start = None
-        self.off_durations = []
-        self.frame_index = 0
+    def update(self, gaze_direction, engagement_prob):
+        """
+        gaze_direction: ON_SCREEN | OFF_SCREEN | ABSENT
+        """
 
-    def update(self, gaze_state, engagement_prob):
-        self.frame_index += 1
+        is_off = gaze_direction == "OFF_SCREEN"
 
-        # Normalize gaze
-        g_val = 1.0 if gaze_state == "ON_SCREEN" else 0.0
-        e_val = float(engagement_prob) if engagement_prob is not None else 0.0
+        # ---- GAZE BUFFER ----
+        self.gaze_buffer.append(0 if is_off else 1)
 
-        self.gaze_buffer.append(g_val)
-        self.engagement_buffer.append(e_val)
+        ep = engagement_prob if engagement_prob is not None else 0.0
+        self.engagement_buffer.append(ep)
 
-        # ---- Track OFF-SCREEN duration ----
-        if gaze_state == "OFF_SCREEN":
-            if self.current_off_start is None:
-                self.current_off_start = self.frame_index
+        # ---- LOOK-AWAY TRACKING ----
+        if is_off:
+            self.current_off_frames += 1
+            if self.current_off_frames == 1:
+                self.lookaway_events += 1
         else:
-            if self.current_off_start is not None:
-                duration = (self.frame_index - self.current_off_start) / self.fps
-                self.off_durations.append(duration)
-                self.current_off_start = None
+            if self.current_off_frames > 0:
+                duration_sec = self.current_off_frames / self.fps
+                self.off_durations.append(duration_sec)
+                self.current_off_frames = 0
 
-        # ---- Behavior classification ----
+        # ---- BEHAVIOR LABEL ----
+        off_sec = self.current_off_frames / self.fps
+
         if engagement_prob is None:
             behavior = "ABSENT"
-        elif gaze_state == "OFF_SCREEN":
+        elif is_off and off_sec >= MIN_LOOKAWAY_SEC:
             behavior = "DISTRACTED"
-        elif e_val < THRESH_DROWSY_MODEL:
-            behavior = "DROWSY/BORED"
+        elif ep < DROWSY_THRESHOLD:
+            behavior = "DROWSY / BORED"
         else:
             behavior = "FOCUSED"
 
@@ -59,56 +71,66 @@ class AttentionFusion:
         if not self.gaze_buffer:
             return None
 
-        ogr = np.mean(self.gaze_buffer)
-        ep = np.mean(self.engagement_buffer)
-        cas = (0.6 * ep) + (0.4 * ogr)
+        ogr = float(np.mean(self.gaze_buffer))
+        ep = float(np.mean(self.engagement_buffer))
 
-        # Derived metrics
-        off_ratio = 1.0 - ogr
-        avg_off_duration = np.mean(self.off_durations) if self.off_durations else 0
-        max_off_duration = max(self.off_durations) if self.off_durations else 0
-        looking_away_events = len(self.off_durations)
+        # ---- NORMALIZED PENALTIES ----
+        max_off = max(self.off_durations) if self.off_durations else 0
+        norm_off_duration = min(max_off / MAX_LOOKAWAY_SEC, 1.0)
+        norm_off_events = min(self.lookaway_events / MAX_LOOKAWAY_EVENTS, 1.0)
 
-        if cas >= THRESH_HIGH_ATTENTION:
-            state = "HIGHLY ENGAGED"
-        elif cas >= THRESH_LOW_ATTENTION:
-            state = "PARTIALLY ENGAGED"
+        # ---- COMPOSITE ATTENTIVENESS SCORE ----
+        cas = (
+            0.4 * ep +
+            0.3 * ogr +
+            0.2 * (1 - norm_off_duration) +
+            0.1 * (1 - norm_off_events)
+        )
+
+        # ---- STATE ----
+        if cas >= HIGH_ATTENTION:
+            state = "ATTENTIVE"
+        elif cas >= MID_ATTENTION:
+            state = "PARTIALLY ATTENTIVE"
         else:
-            state = "DISENGAGED"
+            state = "INATTENTIVE"
+
+        current_off_sec = round(self.current_off_frames / self.fps, 2)
 
         return {
             "OGR": round(ogr, 2),
             "EP": round(ep, 2),
             "CAS": round(cas, 2),
-            "Off_Screen_Ratio": round(off_ratio, 2),
-            "Avg_Off_Duration_sec": round(avg_off_duration, 2),
-            "Max_Off_Duration_sec": round(max_off_duration, 2),
-            "Looking_Away_Events": looking_away_events,
             "STATE": state,
-            "BEHAVIOR": self.behavior_history[-1]
+            "Looking_Away_Events": self.lookaway_events,
+            "Current_Off_Duration_sec": current_off_sec,
+            "Max_Off_Duration_sec": round(max_off, 2)
         }
-    
+
+
 def summarize_session(logs, behavior_history):
     if not logs:
         return None
 
-    avg_cas = np.mean([l["CAS"] for l in logs])
-    avg_ogr = np.mean([l["OGR"] for l in logs])
+    avg_cas = round(np.mean([l["CAS"] for l in logs]), 2)
 
-    distracted = behavior_history.count("DISTRACTED")
-    focused = behavior_history.count("FOCUSED")
+    counts = Counter(behavior_history)
+    total = sum(counts.values())
 
-    # Interpretation logic
-    if avg_ogr > 0.7 and avg_cas > 0.7:
-        verdict = "SUSTAINED ATTENTIVENESS"
-    elif distracted > focused:
-        verdict = "FREQUENT DISTRACTION DETECTED"
+    breakdown = {
+        k: round((v / total) * 100, 1)
+        for k, v in counts.items()
+    }
+
+    if breakdown.get("FOCUSED", 0) >= 60:
+        verdict = "HIGH ENGAGEMENT"
+    elif breakdown.get("FOCUSED", 0) >= 30:
+        verdict = "MODERATE ENGAGEMENT"
     else:
-        verdict = "INTERMITTENT ATTENTION (NORMAL THINKING PATTERNS)"
+        verdict = "LOW ENGAGEMENT"
 
     return {
-        "Average_CAS": round(avg_cas, 2),
-        "Average_OGR": round(avg_ogr, 2),
-        "Total_Looking_Away_Events": distracted,
-        "Final_Verdict": verdict
+        "Average_CAS": avg_cas,
+        "Final_Verdict": verdict,
+        "Behavior_Breakdown": breakdown
     }
